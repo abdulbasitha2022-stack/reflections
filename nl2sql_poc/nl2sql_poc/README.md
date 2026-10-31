@@ -44,6 +44,14 @@ question
   → logs/requests.jsonl  who asked, SQL, tokens, cached tokens, latency, status
 ```
 
+## Runtime logging
+
+The CLI and API write timestamped operational logs to stderr at `INFO` level by default.
+Set `CHATBOT_LOG_LEVEL` to `DEBUG`, `WARNING`, or `ERROR` to adjust verbosity. Console logs include
+request outcomes, timings, provider/model names, and failure context; they do not include prompts,
+chat message text, generated SQL, or credentials. The configured JSONL request/audit files remain
+separate and retain their existing detailed fields, including questions and SQL.
+
 ## Swapping the AI agent or the database
 
 Edit `config.yaml`, no code changes:

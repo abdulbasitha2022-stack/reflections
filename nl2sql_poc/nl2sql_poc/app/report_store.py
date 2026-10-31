@@ -13,10 +13,13 @@ Uses the restricted `view_builder` account (SELECT + INSERT/UPDATE on the bookke
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 
 from .naming import validate_view_name
+
+log = logging.getLogger("chatbot.report_store")
 
 # Columns that may be changed after the row is created (session_id, request_id, request_ts and
 # day_id are fixed at creation; satisfaction has its own method).
@@ -51,6 +54,16 @@ class ReportStore:
         return f"{self.host}:{self.port}"
 
     def _connect(self):
+        try:
+            connection = self._open_connection()
+        except Exception:
+            log.exception("Could not connect to report database server=%s database=%s",
+                          self.server, self.database)
+            raise
+        log.debug("Connected to report database server=%s database=%s", self.server, self.database)
+        return connection
+
+    def _open_connection(self):
         import pymysql
         return pymysql.connect(host=self.host, port=self.port, user=self.user,
                                password=self.password, database=self.database, autocommit=True,
@@ -70,6 +83,7 @@ class ReportStore:
                      sql_source, request_ts, day_id))
         finally:
             conn.close()
+        log.info("Request metadata created request_id=%s status=%s", request_id, request_status)
 
     def fetch_metadata(self, request_id):
         import pymysql
@@ -106,6 +120,8 @@ class ReportStore:
                         raise LookupError(f"request_id '{request_id}' was not found")
         finally:
             conn.close()
+        log.info("Request metadata updated request_id=%s fields=%s", request_id,
+                 ",".join(sorted(fields)))
 
     def set_satisfaction(self, request_id, session_id=None, value: bool = True) -> dict:
         """UPDATE (never insert) customer_satisfaction of the request that belongs to this session.
@@ -156,6 +172,7 @@ class ReportStore:
                 finally:
                     conn.close()
             except Exception:
+                log.warning("Could not check report view name view_name=%s", view_name, exc_info=True)
                 continue
         return False
 
@@ -175,6 +192,7 @@ class ReportStore:
             raise
         finally:
             conn.close()
+        log.info("Database view created view_name=%s", view_name)
 
     def log_view(self, session_id, question, sql_text, view_name, assumptions):
         conn = self._connect()
@@ -186,6 +204,7 @@ class ReportStore:
                     (session_id, question, sql_text, view_name, " | ".join(assumptions) or None))
         finally:
             conn.close()
+        log.info("Report view record saved view_name=%s", view_name)
 
     def view_columns(self, view_name: str) -> list:
         conn = self._connect()
@@ -214,6 +233,7 @@ class ReportStore:
                       r.get("chart_type"), r.get("requested_by"), utc_naive_now()) for r in rows])
         finally:
             conn.close()
+        log.debug("Conversation messages saved count=%d", len(rows))
 
     _CONV_COLUMNS = ("session_id, seq, request_id, role, message_kind AS kind, intent, "
                      "message_text AS text, view_name, page_name, chart_type, requested_by, created_at")

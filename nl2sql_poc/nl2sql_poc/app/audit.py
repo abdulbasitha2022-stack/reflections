@@ -47,8 +47,8 @@ class ConversationRecorder:
                     with open(self.path, "a", encoding="utf-8") as handle:
                         for row in rows:
                             handle.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
-            except Exception:
-                log.exception("Could not write the conversation log file")
+            except OSError:
+                log.exception("Could not write conversation log file path=%s", self.path)
         if self._db_ok:
             try:
                 self.store.log_messages(rows)
@@ -63,10 +63,12 @@ class ConversationRecorder:
             return []
         rows = []
         with open(self.path, encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, 1):
                 try:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
+                    log.warning("Ignoring malformed conversation log line path=%s line=%d",
+                                self.path, line_number)
                     continue
         return rows
 
@@ -76,7 +78,7 @@ class ConversationRecorder:
             if rows:
                 return json_safe(rows)
         except Exception:
-            pass
+            log.exception("Database conversation lookup failed; trying file fallback")
         return sorted((r for r in self._file_rows() if r["session_id"] == session_id),
                       key=lambda r: r["seq"])
 
@@ -86,7 +88,7 @@ class ConversationRecorder:
             if rows:
                 return json_safe(rows)
         except Exception:
-            pass
+            log.exception("Database request conversation lookup failed; trying file fallback")
         return sorted((r for r in self._file_rows() if r.get("request_id") == request_id),
                       key=lambda r: (r["session_id"], r["seq"]))
 
@@ -96,7 +98,7 @@ class ConversationRecorder:
             if rows:
                 return json_safe(rows)
         except Exception:
-            pass
+            log.exception("Database conversation listing failed; trying file fallback")
         grouped: dict = {}
         for row in self._file_rows():
             g = grouped.setdefault(row["session_id"], {"session_id": row["session_id"],

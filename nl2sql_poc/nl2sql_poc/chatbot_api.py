@@ -37,13 +37,14 @@ import uuid
 from pathlib import Path
 
 import yaml
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 
 from app.audit import ConversationRecorder, format_conversation_text
 from app.clock import app_timezone, to_day_id, to_utc_naive, utc_now
 from app.conversation import ConversationEngine, Outcome, quick_take
 from app.guardrails import GuardrailError, validate_sql
 from app.identity import Identity, IdentityResolver
+from app.logging_config import configure_logging
 from app.naming import unique_view_name
 from app.pipeline import VISUAL_TYPES, normalize_chart_type
 from app.powerbi_project_generator import PowerBIProjectError
@@ -144,7 +145,12 @@ class ChatService:
             if session.ended:                 # ended while this request was waiting for the lock
                 return self._ended_response(session)
             try:
-                return self._handle_locked(session, message, visual_type, action, body)
+                log.info("Chat turn started session_id=%s action=%s",
+                         session.session_id, action or "message")
+                result = self._handle_locked(session, message, visual_type, action, body)
+                log.info("Chat turn completed session_id=%s status=%s http_status=%d",
+                         session.session_id, result[0].get("status"), result[1])
+                return result
             finally:
                 session.progress = None
                 session.turn_started = None
@@ -227,7 +233,11 @@ class ChatService:
             payload, status = {"status": "error", "message": text, "request_id": failed_request_id}, 500
         if session.end_requested and not session.ended:      # End was clicked while this ran
             self._end_session(session, session.end_reason or "user")
-        return self._payload(session, first_new_id, outcome, payload), status
+        response = self._payload(session, first_new_id, outcome, payload)
+        log.info("Turn outcome handled session_id=%s kind=%s status=%s http_status=%d elapsed_ms=%d",
+                 session.session_id, outcome.kind, response.get("status"), status,
+                 self._turn_ms(session))
+        return response, status
 
     def _payload(self, session, first_new_id, outcome, payload):
         payload = dict(payload)
@@ -270,6 +280,8 @@ class ChatService:
                 sql_source=self.source, request_ts=to_utc_naive(started),
                 day_id=to_day_id(started, self.tz), request_status="initiated")
             session.request_id = request_id
+            log.info("Report request created session_id=%s request_id=%s",
+                     session.session_id, request_id)
         return session.request_id
 
     def _safe_update(self, request_id, **fields):
@@ -399,6 +411,7 @@ class ChatService:
         result = outcome.result
         request_id = self._ensure_row(session)
         title = outcome.title or report_title_from_request(outcome.request)
+        log.info("Report build started session_id=%s request_id=%s", session.session_id, request_id)
         assumptions = list(dict.fromkeys(list(result.assumptions or []) + list(outcome.assumptions or [])))
         day = to_day_id(session.thread_started or self.clock(), self.tz)
         try:
@@ -453,6 +466,10 @@ class ChatService:
         session.remember(user_text, history_note)
         session.end_thread()
         self._schedule_reload(session, project)
+        log.info("Report build completed session_id=%s request_id=%s view_name=%s "
+                 "status=%s rows=%d response_ms=%d",
+                 session.session_id, request_id, view_name,
+                 "completed" if page_ok else "failed", len(rows), response_ms)
 
         preview = [dict(zip(columns, row)) for row in rows[:10]]
         return {
@@ -612,6 +629,7 @@ class ChatService:
         entry = session.add_message("assistant", SESSION_ENDED_TEXT, kind="status",
                                     meta={"session_ended": True, "reason": reason})
         self.recorder.record(session, [entry], request_id=None, intent="session_end")
+        log.info("Conversation session ended session_id=%s reason=%s", session.session_id, reason)
         return entry
 
     def end_session(self, session_id, reason=None, identity: Identity | None = None):
@@ -930,6 +948,7 @@ def report_title_from_request(request_text, fallback="Billing Report") -> str:
 def create_app(cfg_path=None, *, cfg=None, llm=None, db=None, store=None, powerbi=None,
                background=None) -> Flask:
     """Build the app. Every dependency can be injected, which is how the tests run offline."""
+    configure_logging()
     from app.db import build_db
     from app.llm import build_llm
     from app.pipeline import Pipeline
@@ -945,6 +964,8 @@ def create_app(cfg_path=None, *, cfg=None, llm=None, db=None, store=None, powerb
     log_file = (cfg.get("pipeline", {}) or {}).get("conversation_log_file")
     recorder = ConversationRecorder(store, BASE / log_file if log_file else None)
     service = ChatService(cfg, pipeline, store, powerbi, background=background, recorder=recorder)
+    log.info("Chatbot service initialized provider=%s model=%s dialect=%s",
+             pipeline.llm.name, pipeline.llm.model, pipeline.db.dialect)
 
     def who(body=None):
         """Trusted identity of the caller (None-values when unknown). Never from the request body."""
@@ -952,6 +973,10 @@ def create_app(cfg_path=None, *, cfg=None, llm=None, db=None, store=None, powerb
 
     app = Flask(__name__)
     app.config["SERVICE"] = service
+
+    @app.before_request
+    def request_started():
+        g.request_started_at = time.perf_counter()
 
     @app.after_request
     def cors(response):
@@ -961,6 +986,12 @@ def create_app(cfg_path=None, *, cfg=None, llm=None, db=None, store=None, powerb
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         if request.headers.get("Access-Control-Request-Private-Network"):
             response.headers["Access-Control-Allow-Private-Network"] = "true"
+        started = getattr(g, "request_started_at", None)
+        elapsed_ms = round((time.perf_counter() - started) * 1000) if started is not None else -1
+        log_method = log.error if response.status_code >= 500 else (
+            log.warning if response.status_code >= 400 else log.info)
+        log_method("HTTP request completed method=%s endpoint=%s status=%d elapsed_ms=%d",
+                   request.method, request.endpoint or "unknown", response.status_code, elapsed_ms)
         return response
 
     def reply(result):
@@ -1065,8 +1096,11 @@ def create_app(cfg_path=None, *, cfg=None, llm=None, db=None, store=None, powerb
 
 def main():
     app = create_app()
-    app.run(host=os.getenv("CHATBOT_HOST", "127.0.0.1"), port=int(os.getenv("CHATBOT_PORT", "5056")),
-            debug=os.getenv("FLASK_DEBUG") == "1", use_reloader=False, threaded=True)
+    host = os.getenv("CHATBOT_HOST", "127.0.0.1")
+    port = int(os.getenv("CHATBOT_PORT", "5056"))
+    debug = os.getenv("FLASK_DEBUG") == "1"
+    log.info("Starting chatbot API host=%s port=%d debug=%s", host, port, debug)
+    app.run(host=host, port=port, debug=debug, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":

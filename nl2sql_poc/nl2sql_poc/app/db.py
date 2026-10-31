@@ -11,13 +11,17 @@ Same idea as llm.py: the pipeline only sees DBProvider (dialect, describe, execu
 `dialect` is the sqlglot dialect name. It is used by the guardrails to parse the model's SQL and
 by the prompt so the model writes the right flavour of SQL.
 """
+import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import NoSuchTableError, SQLAlchemyError
+
+log = logging.getLogger("chatbot.db")
 
 
 class QueryError(RuntimeError):
@@ -62,6 +66,8 @@ class SQLAlchemyProvider(DBProvider):
         self.engine = create_engine(url, pool_pre_ping=True)
         self.dialect = _SQLGLOT_DIALECTS.get(self.engine.dialect.name, self.engine.dialect.name)
         self.timeout_ms = int(cfg.get("statement_timeout_ms", 15000))
+        log.info("Database provider initialized dialect=%s statement_timeout_ms=%d",
+                 self.dialect, self.timeout_ms)
 
     def _prepare(self, conn):
         """Hook: per-connection safety settings. Subclasses override."""
@@ -73,23 +79,30 @@ class SQLAlchemyProvider(DBProvider):
             try:
                 cols = insp.get_columns(t)
             except NoSuchTableError:
+                log.error("Configured allowed table does not exist table=%s", t)
                 raise RuntimeError(f"Table '{t}' (from db.allowed_tables) does not exist in the "
                                    f"database. Did you run generate_sample_data.py --load?")
             lines.append(f"{t}(" + ", ".join(f"{c['name']} {c['type']}" for c in cols) + ")")
         return "\n".join(lines)
 
     def execute_readonly(self, sql, max_rows):
+        started = time.perf_counter()
         try:
             with self.engine.connect() as conn:
                 self._prepare(conn)
                 result = conn.execute(text(_escape_colons(sql)))
                 columns = list(result.keys())
                 rows = result.fetchmany(max_rows + 1)
-                return QueryResult(columns, [tuple(r) for r in rows[:max_rows]],
-                                   truncated=len(rows) > max_rows)
         except SQLAlchemyError as e:
+            log.warning("Read-only database query failed dialect=%s elapsed_ms=%d error_type=%s",
+                        self.dialect, round((time.perf_counter() - started) * 1000), type(e).__name__)
             msg = str(getattr(e, "orig", None) or e).strip().splitlines()[0]
             raise QueryError(msg) from e
+        log.info("Read-only database query completed dialect=%s rows=%d truncated=%s elapsed_ms=%d",
+                 self.dialect, len(rows[:max_rows]), len(rows) > max_rows,
+                 round((time.perf_counter() - started) * 1000))
+        return QueryResult(columns, [tuple(r) for r in rows[:max_rows]],
+                           truncated=len(rows) > max_rows)
 
 
 class PostgresProvider(SQLAlchemyProvider):

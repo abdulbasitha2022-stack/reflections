@@ -7,6 +7,7 @@ Two LLM stages, both stateless helpers (conversation memory lives in session.py)
 """
 import getpass
 import json
+import logging
 import re
 import time
 import uuid
@@ -17,6 +18,8 @@ from pathlib import Path
 from .db import QueryError
 from .guardrails import GuardrailError, validate_sql
 from .prompt import build_planner_prompt, build_system_prompt
+
+log = logging.getLogger("chatbot.pipeline")
 
 REPORT_INTENTS = ("new_report", "modify_report")
 INTENTS = ("chat", "explain", "new_report", "modify_report", "change_chart", "clarify", "decline")
@@ -204,6 +207,8 @@ class Pipeline:
         self._extra_rules = context_cfg.get("extra_rules", "")
         self._schema_text = db.describe(self.allowed)
         self._sql_system, self._sql_system_day = None, None
+        log.info("Pipeline initialized provider=%s model=%s dialect=%s allowed_tables=%d",
+                 self.llm.name, self.llm.model, self.db.dialect, len(self.allowed))
 
     # The prompts embed today's date. Rebuild when the day changes so a server that stays up
     # for days still resolves "last month" / "this year" correctly.
@@ -226,23 +231,33 @@ class Pipeline:
     # ------------------------------------------------------------------ stage 1: plan
     def plan(self, messages: list, state: str = ""):
         """Return (Plan, Usage). Retries once when the reply is not valid JSON."""
+        started = time.perf_counter()
         system = self.planner_system(state)
         usage, msgs, last_error = Usage(), list(messages), None
-        for _ in range(2):
+        for attempt in range(1, 3):
             try:
                 response = self.llm.complete(system, msgs)
             except Exception as exc:
+                log.error("Planner LLM call failed attempt=%d error_type=%s",
+                          attempt, type(exc).__name__)
                 raise PlannerError(f"LLM call failed: {exc}") from exc
             usage.add(response)
             try:
-                return parse_plan(response.text), usage
+                plan = parse_plan(response.text)
+                log.info("Planner completed intent=%s confidence=%d attempt=%d elapsed_ms=%d",
+                         plan.intent, plan.confidence, attempt,
+                         round((time.perf_counter() - started) * 1000))
+                return plan, usage
             except ValueError as exc:
                 last_error = exc
+                log.warning("Planner returned an invalid response attempt=%d error_type=%s",
+                            attempt, type(exc).__name__)
                 msgs = msgs + [
                     {"role": "assistant", "content": response.text or "(empty reply)"},
                     {"role": "user", "content": "That was not valid. Reply with ONLY the JSON object "
                                                 "described in the instructions."},
                 ]
+        log.error("Planner failed after retries error_type=%s", type(last_error).__name__)
         raise PlannerError(str(last_error))
 
     # ------------------------------------------------------------------ stage 2: SQL
@@ -250,6 +265,7 @@ class Pipeline:
                      assumptions: list | None = None) -> Result:
         started = time.perf_counter()
         result = Result(request_id=uuid.uuid4().hex[:8], question=request_text)
+        log.info("SQL generation started request_id=%s", result.request_id)
         content = f"Report request: {request_text}"
         if assumptions:
             content += "\nAgreed assumptions (stay consistent with them): " + "; ".join(assumptions)
@@ -265,6 +281,8 @@ class Pipeline:
             try:
                 response = self.llm.complete(system, messages)
             except Exception as exc:
+                log.error("SQL-generation LLM call failed request_id=%s attempt=%d error_type=%s",
+                          result.request_id, attempt, type(exc).__name__)
                 result.status, result.error = "error", f"LLM call failed: {exc}"
                 break
             result.input_tokens += response.input_tokens
@@ -274,16 +292,22 @@ class Pipeline:
 
             if parsed.kind == "clarify":
                 result.status, result.clarification, result.error = "clarify", parsed.clarification, ""
+                log.info("SQL generation requested clarification request_id=%s attempt=%d",
+                         result.request_id, attempt)
                 break
 
             failure = None
             if parsed.kind != "sql":
                 failure = "Reply did not follow the output protocol (expected a SQL block or CLARIFY line)."
                 result.error = failure
+                log.warning("Generated response did not follow the SQL protocol request_id=%s attempt=%d",
+                            result.request_id, attempt)
             else:
                 try:
                     validated = validate_sql(parsed.sql, self.db.dialect, self.allowed, self.max_rows)
                 except GuardrailError as exc:
+                    log.warning("Generated SQL rejected by guardrails request_id=%s attempt=%d",
+                                result.request_id, attempt)
                     result.sql, failure = parsed.sql, str(exc)
                     result.error = failure
                 else:
@@ -291,6 +315,8 @@ class Pipeline:
                     try:
                         query_result = self.db.execute_readonly(validated.sql, self.max_rows)
                     except QueryError as exc:
+                        log.warning("Read-only query failed request_id=%s attempt=%d error_type=%s",
+                                    result.request_id, attempt, type(exc).__name__)
                         result.sql_runtime_ms = round((time.perf_counter() - query_started) * 1000)
                         result.sql, failure = validated.sql, str(exc)
                         result.error = failure
@@ -301,6 +327,9 @@ class Pipeline:
                         result.columns, result.rows = query_result.columns, query_result.rows
                         result.truncated = query_result.truncated
                         break
+            log.warning("Retrying SQL generation request_id=%s attempt=%d failure_type=%s",
+                        result.request_id, attempt,
+                        "invalid_response" if parsed.kind != "sql" else type(failure).__name__)
             messages += [
                 {"role": "assistant", "content": response.text or "(empty reply)"},
                 {"role": "user", "content": f"That failed: {failure}\n"
@@ -309,6 +338,10 @@ class Pipeline:
 
         result.latency_s = round(time.perf_counter() - started, 2)
         self._log(result)
+        log.info("SQL generation completed request_id=%s status=%s attempts=%d rows=%d "
+                 "sql_runtime_ms=%d latency_s=%.2f",
+                 result.request_id, result.status, result.attempts, len(result.rows),
+                 result.sql_runtime_ms, result.latency_s)
         return result
 
     # ------------------------------------------------------------------ CLI convenience
@@ -319,6 +352,7 @@ class Pipeline:
             plan, usage = self.plan([{"role": "user", "content": question}],
                                     "LAST REPORT: none yet. Nothing to explain, modify or re-chart.")
         except PlannerError as exc:
+            log.error("CLI question planning failed error_type=%s", type(exc).__name__)
             return Result(request_id=uuid.uuid4().hex[:8], question=question, status="error",
                           error=f"Prompt evaluation failed: {exc}")
         if plan.intent in REPORT_INTENTS:
@@ -340,9 +374,12 @@ class Pipeline:
     def _append_log(self, entry: dict):
         if not self.log_path:
             return
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.log_path, "a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps(entry, default=str) + "\n")
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(entry, default=str) + "\n")
+        except OSError:
+            log.exception("Could not append request record path=%s", self.log_path)
 
     def _base_entry(self) -> dict:
         return {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),

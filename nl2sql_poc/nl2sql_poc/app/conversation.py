@@ -5,6 +5,7 @@ change). It does not touch MySQL or Power BI - the API layer performs those side
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from .pipeline import (REPORT_INTENTS, Pipeline, PlannerError, Plan, Result, Usa
                        normalize_chart_type)
 from .util import fmt_number, humanize, is_number, json_safe
 from .coverage import DataCoverage, no_data_message
+
+log = logging.getLogger("chatbot.conversation")
 
 _SUM_UNFRIENDLY = ("rate", "pct", "percent", "avg", "average", "ratio", "share")
 
@@ -222,6 +225,7 @@ class ConversationEngine:
         """chart_choice: a chip click on the chart question (may be "auto")."""
         started = time.perf_counter()
         elapsed = lambda: round((time.perf_counter() - started) * 1000)
+        log.info("Conversation turn started session_id=%s", session.session_id)
 
         # 0. Are we waiting for the chart choice? ----------------------------------------------
         pending = session.pending_chart
@@ -243,10 +247,14 @@ class ConversationEngine:
         try:
             plan, usage = self.pipeline.plan(history, self.state_block(session))
         except PlannerError as exc:
+            log.error("Conversation planning failed session_id=%s error_type=%s",
+                      session.session_id, type(exc).__name__)
             return Outcome(kind="error", intent="error", error=str(exc), elapsed_ms=elapsed(),
                            reply="Sorry, I couldn't reach my AI service just now, so I didn't get "
                                  "your request. Please try again in a moment.")
         intent = plan.intent
+        log.info("Conversation plan received session_id=%s intent=%s confidence=%d",
+                 session.session_id, intent, plan.confidence)
         has_report = session.last_report is not None
         explicit_chart = normalize_chart_type(preferred_chart) if preferred_chart else None
 
@@ -333,12 +341,15 @@ class ConversationEngine:
             try:
                 self.on_generation_started(session)
             except Exception:
+                log.exception("Generation-start callback failed session_id=%s", session.session_id)
                 pass                      # bookkeeping must never stop a report; it is retried later
         result = self.pipeline.generate_sql(request, previous=previous, assumptions=assumptions)
         result.intent, result.prompt_score = intent, confidence
         result.input_tokens += usage.input_tokens
         result.output_tokens += usage.output_tokens
         result.cache_read_tokens += usage.cache_read_tokens
+        log.info("Conversation SQL result session_id=%s request_id=%s status=%s rows=%d",
+                 session.session_id, result.request_id, result.status, len(result.rows))
         if result.status == "ok" and not result.rows and self.skip_empty_reports:
             reply, chips = no_data_message(self.coverage, result.sql)
             outcome = Outcome(kind="no_data", intent=intent, request=request, title=title,

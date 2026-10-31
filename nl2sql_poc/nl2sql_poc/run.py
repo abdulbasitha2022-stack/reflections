@@ -11,6 +11,7 @@ run.py - ask questions in plain English, get SQL + results.
 """
 import argparse
 import csv
+import logging
 import sys
 from pathlib import Path
 
@@ -18,7 +19,10 @@ import yaml
 
 from app.db import build_db
 from app.llm import build_llm
+from app.logging_config import configure_logging
 from app.pipeline import Pipeline
+
+log = logging.getLogger("chatbot.cli")
 
 
 def cell(v, width=28):
@@ -75,6 +79,7 @@ def save_csv(res, path):
 
 
 def main():
+    configure_logging()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("question", nargs="?", help="question in plain English")
     ap.add_argument("--config", default="config.yaml")
@@ -84,11 +89,18 @@ def main():
     args = ap.parse_args()
 
     cfg_path = Path(args.config).resolve()
-    cfg = yaml.safe_load(cfg_path.read_text())
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Could not load configuration file path=%s", cfg_path)
+        raise
     try:
         pipe = Pipeline(build_llm(cfg["llm"]), build_db(cfg["db"]), cfg, base_dir=cfg_path.parent)
     except Exception as e:
+        log.exception("Application setup failed")
         sys.exit(f"Setup failed: {e}")
+    log.info("CLI ready provider=%s model=%s dialect=%s",
+             pipe.llm.name, pipe.llm.model, pipe.db.dialect)
 
     if args.show_prompt:
         print(pipe.system)
@@ -103,8 +115,11 @@ def main():
         questions = None                                   # interactive
 
     if questions is not None:
+        log.info("Processing question batch count=%d", len(questions))
         for q in questions:
             res = pipe.ask(q)
+            log.info("Question completed request_id=%s status=%s attempts=%d latency_s=%.2f",
+                     res.request_id, res.status, res.attempts, res.latency_s)
             show(res)
             if args.csv and res.status == "ok":
                 save_csv(res, args.csv)
@@ -117,7 +132,10 @@ def main():
                 break
             if not q:
                 break
-            show(pipe.ask(q))
+            result = pipe.ask(q)
+            log.info("Question completed request_id=%s status=%s attempts=%d latency_s=%.2f",
+                     result.request_id, result.status, result.attempts, result.latency_s)
+            show(result)
 
 
 if __name__ == "__main__":
