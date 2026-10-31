@@ -10,13 +10,17 @@ AFTER the chat reply has been stored and sent. The chatbot restores its conversa
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from .powerbi_project_generator import PowerBIProjectError, generate_native_report_page
+
+log = logging.getLogger("chatbot.powerbi")
 
 
 class PowerBIService:
@@ -41,6 +45,7 @@ class PowerBIService:
 
     # ------------------------------------------------------------------ Desktop helper
     def run_desktop_automation(self, action, table_name=None):
+        started = time.perf_counter()
         timeout_seconds = int(self.automation_cfg.get("timeout_seconds", 180))
         script_path = self.base / "app" / "powerbi_desktop_automation.ps1"
         if not script_path.is_file():
@@ -55,10 +60,12 @@ class PowerBIService:
             completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                                        errors="replace", timeout=timeout_seconds + 30, check=False)
         except subprocess.TimeoutExpired as exc:
+            log.exception("Power BI Desktop automation timed out action=%s", action)
             raise PowerBIProjectError(
                 f"Power BI Desktop automation timed out during '{action}'. "
                 "Check Power BI Desktop and the model refresh status before retrying.") from exc
         except OSError as exc:
+            log.exception("Could not launch Power BI Desktop automation action=%s", action)
             raise PowerBIProjectError(
                 f"Could not launch PowerShell for Power BI Desktop automation: {exc}") from exc
 
@@ -75,7 +82,11 @@ class PowerBIService:
                 details = str(result.get("error") or result.get("message") or "")
             if not details:
                 details = (completed.stderr or completed.stdout or "No diagnostic output was returned.").strip()[-2500:]
+            log.error("Power BI Desktop automation failed action=%s return_code=%d",
+                      action, completed.returncode)
             raise PowerBIProjectError(f"Power BI Desktop automation '{action}' failed: {details}")
+        log.info("Power BI Desktop automation completed action=%s elapsed_ms=%d",
+                 action, round((time.perf_counter() - started) * 1000))
         return result
 
     # ------------------------------------------------------------------ page generation
@@ -90,18 +101,22 @@ class PowerBIService:
                 "powerbi.enabled is true but report_dir/model_dir are missing from config_billing.yaml.")
         if not re.fullmatch(r"vw_[A-Za-z0-9_]+", view_name):
             raise PowerBIProjectError("Generated view name has an unexpected format.")
+        log.info("Building Power BI page request_id=%s view_name=%s", request_id, view_name)
         with self.lock:
             if self.automation_enabled:
                 # Save pending UI edits (e.g. deleted pages) before the generator writes to disk.
                 self.run_desktop_automation("prepare")
             columns = self.store.view_columns(view_name)
-            return generate_native_report_page(
+            generated = generate_native_report_page(
                 report_dir=report_dir, model_dir=model_dir, view_name=view_name, title=title,
                 columns=columns, mysql_server=self.store.server, database=self.store.database,
                 include_detail_table=bool(self.cfg.get("include_detail_table", True)),
                 requested_visual_type=requested_visual_type,
                 reuse_existing_table=reuse_existing_table, request_id=request_id, session_id=session_id)
+            log.info("Power BI page built request_id=%s view_name=%s", request_id, view_name)
+            return generated
 
     def reload_refresh(self, generated: dict) -> dict:
+        log.info("Reloading Power BI model table=%s", generated["model_table"])
         with self.lock:
             return self.run_desktop_automation("reload_refresh", table_name=generated["model_table"])

@@ -10,12 +10,15 @@ new imported rows can be displayed. Always work on a saved, backed-up project.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+
+log = logging.getLogger("chatbot.powerbi_project")
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -500,6 +503,7 @@ def generate_native_report_page(
         # message remains visible. The new report is still added to pageOrder and can be opened by name.
         _json_write(pages_meta_file, pages_meta)
     except Exception:
+        log.exception("Power BI project update failed; attempting to roll back generated files")
         # Best-effort rollback of model metadata; generated page/table are removed to avoid partial output.
         try:
             shutil.rmtree(page_folder, ignore_errors=True)

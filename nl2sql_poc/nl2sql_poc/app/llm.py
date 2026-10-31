@@ -9,9 +9,24 @@ PROVIDERS. Nothing else needs to know.
 The interface is deliberately tiny: (system prompt, message list) -> text + token usage.
 Prompt *quality* is NOT portable across vendors, so expect to re-tune prompt.py per provider.
 """
+import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+
+log = logging.getLogger("chatbot.llm")
+
+
+def _log_completion(provider: str, model: str, started: float, response: "LLMResponse") -> None:
+    log.info("LLM request completed provider=%s model=%s elapsed_ms=%d input_tokens=%d "
+             "output_tokens=%d",
+             provider, model, round((time.perf_counter() - started) * 1000),
+             response.input_tokens, response.output_tokens)
+
+
+def _log_failure(provider: str, model: str) -> None:
+    log.exception("LLM request failed provider=%s model=%s", provider, model)
 
 
 @dataclass
@@ -44,6 +59,7 @@ class ClaudeProvider(LLMProvider):
         self.client = anthropic.Anthropic()
 
     def complete(self, system, messages):
+        started = time.perf_counter()
         kwargs = dict(model=self.model, max_tokens=self.cfg.get("max_tokens", 1500),
                       messages=messages)
         # The schema + data dictionary is a big, identical prefix on every request. Marking it
@@ -58,13 +74,19 @@ class ClaudeProvider(LLMProvider):
         if self.cfg.get("temperature") is not None:
             kwargs["temperature"] = self.cfg["temperature"]
 
-        resp = self.client.messages.create(**kwargs)
+        try:
+            resp = self.client.messages.create(**kwargs)
+        except Exception:
+            _log_failure(self.name, self.model)
+            raise
         text = "".join(b.text for b in resp.content if b.type == "text")
         u = resp.usage
-        return LLMResponse(
+        result = LLMResponse(
             text=text, input_tokens=u.input_tokens, output_tokens=u.output_tokens,
             extra={"cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
                    "cache_write_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0})
+        _log_completion(self.name, self.model, started, result)
+        return result
 
 
 class OpenAIProvider(LLMProvider):
@@ -77,13 +99,20 @@ class OpenAIProvider(LLMProvider):
         self.client = OpenAI()                             # reads OPENAI_API_KEY
 
     def complete(self, system, messages):
+        started = time.perf_counter()
         # No max_tokens / temperature passed on purpose: parameter names and support differ
         # between OpenAI model families, and the defaults are fine for a POC.
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=[{"role": "system", "content": system}] + messages)
-        return LLMResponse(text=resp.choices[0].message.content or "",
-                           input_tokens=resp.usage.prompt_tokens,
-                           output_tokens=resp.usage.completion_tokens)
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model, messages=[{"role": "system", "content": system}] + messages)
+        except Exception:
+            _log_failure(self.name, self.model)
+            raise
+        result = LLMResponse(text=resp.choices[0].message.content or "",
+                             input_tokens=resp.usage.prompt_tokens,
+                             output_tokens=resp.usage.completion_tokens)
+        _log_completion(self.name, self.model, started, result)
+        return result
 
 
 class GroqProvider(LLMProvider):
@@ -109,6 +138,7 @@ class GroqProvider(LLMProvider):
         )
 
     def complete(self, system, messages):
+        started = time.perf_counter()
         kwargs = dict(
             model=self.model,
             messages=[{"role": "system", "content": system}, *messages],
@@ -119,18 +149,26 @@ class GroqProvider(LLMProvider):
         if self.cfg.get("reasoning_effort"):
             kwargs["extra_body"] = {"reasoning_effort": self.cfg["reasoning_effort"]}
 
-        response = self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception:
+            _log_failure(self.name, self.model)
+            raise
         choice = response.choices[0]
         text = choice.message.content or ""
         if not text.strip() and choice.finish_reason == "length":
+            log.error("LLM response exhausted its output limit provider=%s model=%s",
+                      self.name, self.model)
             raise RuntimeError("The model ran out of output tokens before answering "
                                "(raise llm.groq.max_tokens or lower reasoning_effort).")
         usage = response.usage
-        return LLMResponse(
+        result = LLMResponse(
             text=text,
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
         )
+        _log_completion(self.name, self.model, started, result)
+        return result
 
 
 PROVIDERS = {"claude": ClaudeProvider, "openai": OpenAIProvider, "groq": GroqProvider}

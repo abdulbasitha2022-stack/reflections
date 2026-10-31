@@ -5,6 +5,7 @@ session id that the visual stores and sends back. Nothing in this module touches
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -13,6 +14,8 @@ from datetime import datetime
 from typing import Callable
 
 from .clock import utc_now
+
+log = logging.getLogger("chatbot.session")
 
 MAX_HISTORY_MESSAGES = 40       # LLM memory kept per session (user + assistant messages)
 MAX_TRANSCRIPT_MESSAGES = 400   # what the UI can restore
@@ -126,12 +129,19 @@ class SessionStore:
 
     def _purge(self) -> None:
         now = time.time()
-        for sid in [s for s, v in self._sessions.items() if now - v.updated > self.ttl_seconds]:
+        expired = [sid for sid, value in self._sessions.items()
+                   if now - value.updated > self.ttl_seconds]
+        for sid in expired:
             del self._sessions[sid]
+        if expired:
+            log.info("Expired inactive sessions count=%d", len(expired))
         if len(self._sessions) > self.max_sessions:
             oldest = sorted(self._sessions.values(), key=lambda v: v.updated)
-            for session in oldest[: len(self._sessions) - self.max_sessions]:
+            evicted = oldest[: len(self._sessions) - self.max_sessions]
+            for session in evicted:
                 del self._sessions[session.session_id]
+            log.warning("Evicted sessions above capacity count=%d maximum=%d",
+                        len(evicted), self.max_sessions)
 
     def get(self, session_id: str) -> ChatSession | None:
         with self._lock:
@@ -145,6 +155,7 @@ class SessionStore:
             session = self._sessions.get(sid)
             if session is None:
                 session = self._sessions[sid] = ChatSession(session_id=sid)
+                log.info("Conversation session created session_id=%s", sid)
             return session
 
     def latest(self, max_age_seconds: float | None = None) -> ChatSession | None:
@@ -158,4 +169,7 @@ class SessionStore:
 
     def delete(self, session_id: str) -> bool:
         with self._lock:
-            return self._sessions.pop(session_id, None) is not None
+            deleted = self._sessions.pop(session_id, None) is not None
+            if deleted:
+                log.info("Conversation session deleted session_id=%s", session_id)
+            return deleted

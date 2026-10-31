@@ -1,5 +1,6 @@
 """Pipeline tests: planner parsing, SQL stage retries, day rollover. No network or database."""
 import json
+import logging
 from datetime import date
 
 import pytest
@@ -96,6 +97,20 @@ def test_generate_sql_happy_path_and_log(tmp_path):
     first_user = llm.calls[0][1][0]["content"]
     assert "Report request: Daily revenue" in first_user and "period: all time" in first_user
     assert (tmp_path / "log.jsonl").read_text().count("\n") == 1
+
+
+def test_generate_sql_emits_operational_logs_without_request_content(caplog, tmp_path):
+    pipe, _, _ = make([SQL], tmp_path)
+    caplog.set_level(logging.INFO, logger="chatbot.pipeline")
+
+    result = pipe.generate_sql("Sensitive customer request")
+
+    assert result.status == "ok"
+    assert "SQL generation started" in caplog.text
+    assert "SQL generation completed" in caplog.text
+    assert result.request_id in caplog.text
+    assert "Sensitive customer request" not in caplog.text
+    assert "SELECT month_start" not in caplog.text
 
 
 def test_generate_sql_includes_previous_sql_for_revisions(tmp_path):
